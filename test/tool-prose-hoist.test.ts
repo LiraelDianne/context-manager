@@ -1,12 +1,14 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 import { hoistToolProse, toolProseStub, DEFAULT_TOOL_PROSE_RESULT } from '../src/tool-prose-hoist.js';
+import { redactToolArguments } from '../src/tool-arg-redaction.js';
 
 // Tool-prose hoist rung (2026-09-19, sill). Long prose in a private-reasoning
 // tool argument (skip_reply.reason) gets an L1 request refused regardless of
@@ -83,8 +85,31 @@ describe('hoistToolProse (pure)', () => {
   });
 });
 
+describe('redactToolArguments (pure)', () => {
+  it('empties only configured private string fields and leaves raw input untouched', () => {
+    const messages = [
+      { participant: 'Claude', content: [use('r', 'skip_reply', { reason: DIARY, wake_in_seconds: 1500 })] },
+      { participant: 'Claude', content: [use('s', 'send_message', { reason: DIARY })] },
+    ];
+    const transformed = redactToolArguments(messages, { fromTools: ['skip_reply'], fields: ['reason'] });
+    assert.equal(transformed.redacted, 1);
+    assert.equal(transformed.characters, DIARY.length);
+    const redacted = transformed.messages[0]!.content[0] as ContentBlock & { input: Record<string, unknown> };
+    assert.equal(redacted.input.reason, '');
+    assert.equal(redacted.input.wake_in_seconds, 1500);
+    assert.equal((transformed.messages[1]!.content[0] as ContentBlock & { input: Record<string, unknown> }).input.reason, DIARY);
+    assert.equal((messages[0]!.content[0] as unknown as { input: { reason: string } }).input.reason, DIARY);
+  });
+
+  it('matches namespaced tools and returns zero without qualifying prose', () => {
+    const messages = [{ participant: 'Claude', content: [use('r', 'agent--skip_reply', { reason: '' })] }];
+    assert.equal(redactToolArguments(messages, { fromTools: ['skip_reply'], fields: ['reason'] }).redacted, 0);
+  });
+});
+
 class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void { this.pushSummary(entry); }
+  entries(): SummaryEntry[] { return [...this.summaries]; }
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
 }
 function managerContext(manager: ContextManager): StrategyContext {
@@ -94,13 +119,14 @@ const tool = (name: string): ToolDefinition => ({ name, description: 'd', inputS
 const REFUSAL = { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
 const OK = (t: string) => ({ content: [text(t)], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } });
 
-interface Opts { hoist?: boolean; sourceOnlyFallback?: boolean; tools?: string[]; reason?: string; path?: string; }
+interface Opts { redact?: boolean; hoist?: boolean; sourceOnlyFallback?: boolean; tools?: string[]; reason?: string; path?: string; }
 function config(opts: Opts) {
   return {
     compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
     compressionRefusalCurveFallbacks: 0,
     compressionSourceOnlyFallback: opts.sourceOnlyFallback,
+    ...(opts.redact ? { compressionPrivateToolRedactionFallback: { fromTools: ['skip_reply'], fields: ['reason'] } } : {}),
     ...(opts.hoist ? { compressionToolProseFallback: { intoTool: 'journal', fromTools: ['skip_reply'] } } : {}),
   } as never;
 }
@@ -128,6 +154,84 @@ function scripted(responses: Array<typeof REFUSAL | ReturnType<typeof OK>>) {
 // The fixture's large head window replays the chunk's messages in the head as
 // well as in the target slot, so canonical requests carry each call twice.
 const names = (req: NormalizedRequest): string => [...new Set(toolUses(req).map((u) => u.name))].join('+');
+const requestHash = (req: NormalizedRequest): string =>
+  createHash('sha256').update(JSON.stringify(req), 'utf8').digest('hex');
+
+describe('private tool-argument redaction rung', () => {
+  it('retries a reasoning_extraction refusal with only the private reason emptied', async () => {
+    const { calls, membrane } = scripted([REFUSAL, OK('privacy-preserving memory')]);
+    const fx = await build(membrane, { redact: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(calls.length, 2);
+    assert.ok(toolUses(calls[0]!).every((u) => u.input.reason === DIARY));
+    assert.ok(toolUses(calls[1]!).every((u) => u.input.reason === ''), 'private rationale omitted only on retry');
+    assert.equal((managerContext(fx.manager).messageStore.getAll().find((m) =>
+      m.content.some((b) => b.type === 'tool_use' && b.name === 'skip_reply'))!
+      .content.find((b) => b.type === 'tool_use') as ContentBlock & { input: Record<string, unknown> }).input.reason, DIARY,
+      'raw Chronicle source stays byte-semantically intact');
+    const minted = fx.strategy.entries().find((entry) => entry.sourceIds.includes(fx.ids[11]!));
+    assert.equal(minted?.provenance?.requestHash, requestHash(calls[1]!), 'provenance names accepted redacted request');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+  });
+
+  it('does not retry other refusal categories', async () => {
+    const OTHER = { ...REFUSAL, raw: { response: { stop_details: { category: 'policy' } } } };
+    const { calls, membrane } = scripted([OTHER]);
+    const fx = await build(membrane, { redact: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(calls.length, 1);
+  });
+
+  it('redaction runs before the richer hoist, which remains available after a redacted refusal', async () => {
+    const { calls, membrane } = scripted([REFUSAL, REFUSAL, OK('hoisted after privacy retry')]);
+    const fx = await build(membrane, { redact: true, hoist: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls.map(names), ['skip_reply', 'skip_reply', 'journal+skip_reply']);
+    assert.ok(toolUses(calls[1]!).every((u) => u.input.reason === ''));
+  });
+
+  it('failed redaction is quarantined and does not reburn the pair', async () => {
+    const { calls, membrane } = scripted([REFUSAL]);
+    const fx = await build(membrane, { redact: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(calls.length, 2, 'canonical plus one privacy retry');
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(calls.length, 2, 'durable quarantine prevents reburn');
+  });
+
+  it('ORDER: source-only receives privacy retry before its hoist too', async () => {
+    const { calls, membrane } = scripted([REFUSAL]);
+    const fx = await build(membrane, { redact: true, hoist: true, sourceOnlyFallback: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.deepEqual(calls.map(names), [
+      'skip_reply', 'skip_reply', 'journal+skip_reply',
+      'skip_reply', 'skip_reply', 'journal+skip_reply',
+    ]);
+    assert.ok(toolUses(calls[1]!).every((u) => u.input.reason === ''));
+    assert.ok(toolUses(calls[4]!).every((u) => u.input.reason === ''));
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(calls.length, 6, 'combined redaction+hoist regime stays quarantined after persistence');
+  });
+
+  it('enabling redaction opens a fresh bounded quarantine regime', async () => {
+    const path = freshPath();
+    const first = scripted([REFUSAL]);
+    const a = await build(first.membrane, { path });
+    await a.strategy.run(a.target(), managerContext(a.manager));
+    await a.strategy.run(a.target(), managerContext(a.manager));
+    assert.equal(first.calls.length, 1, 'old regime is sticky');
+    a.manager.close();
+
+    const second = scripted([REFUSAL, OK('fresh private-redaction regime')]);
+    const strategy = new ProbeStrategy(config({ redact: true }));
+    const manager = await ContextManager.open({ path, strategy, membrane: second.membrane });
+    manager.setToolDefinitions(['skip_reply', 'journal'].map(tool));
+    await strategy.run(targetOf(manager, a.ids), managerContext(manager));
+    assert.equal(second.calls.length, 2);
+    manager.close();
+  });
+});
 
 describe('tool-prose hoist rung', () => {
   it('RUNG: canonical refusal → one hoisted canonical retry, which lands the memory', async () => {

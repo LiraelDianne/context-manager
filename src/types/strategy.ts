@@ -1196,6 +1196,34 @@ export interface AutobiographicalConfig {
   /** Final bounded source-only L1 attempt after canonical + recall variants. */
   compressionSourceOnlyFallback?: boolean;
   /**
+   * Private tool-argument redaction rung. Off unless set.
+   *
+   * Some host tools explicitly promise that an argument is private operational
+   * rationale (for example `skip_reply.reason`). Replaying that prose to a
+   * summarizer both crosses the tool's privacy boundary and can be refused as
+   * `reasoning_extraction`. After — and only after — such a refusal, retry once
+   * with configured top-level string arguments emptied in the provider-facing
+   * request. Raw Chronicle messages are unchanged. If this rung and the richer
+   * tool-prose hoist are both enabled, redaction runs first; a redaction refusal
+   * may still fall through to the hoist and existing bounded ladder.
+   *
+   * This is refusal-triggered privacy, not privacy-by-default: the initial
+   * canonical attempt still carries the configured fields; this rung prevents
+   * their re-transmission on the retry. Always eliding them would be a separate,
+   * larger request-shaping policy.
+   *
+   * Only configured top-level, nonempty string arguments are eligible. Nested,
+   * array-valued, non-string, absent, and already-empty fields are left unchanged.
+   * Enabling/changing this is a distinct quarantine regime, so previously
+   * exhausted spans earn a fresh bounded attempt. See `tool-arg-redaction.ts`.
+   */
+  compressionPrivateToolRedactionFallback?: {
+    /** Tools to rewrite (exact name or final `--` segment). Required. */
+    fromTools: string[];
+    /** Top-level string argument names to empty. Required. */
+    fields: string[];
+  };
+  /**
    * Tool-prose hoist rung (2026-09-19, sill). Off unless set.
    *
    * Long prose in an argument of a private-reasoning tool (`skip_reply.reason`,

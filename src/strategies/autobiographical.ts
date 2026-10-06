@@ -43,6 +43,10 @@ import {
   DEFAULT_TOOL_PROSE_RESULT,
   type ToolProseHoistOptions,
 } from '../tool-prose-hoist.js';
+import {
+  redactToolArguments,
+  type ToolArgRedactionOptions,
+} from '../tool-arg-redaction.js';
 import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
@@ -515,6 +519,8 @@ interface CompressionRefusalNormalizedConfig {
   requestConfig: NormalizedRequest['config'];
   sourceOnlyFallbackEnabled?: boolean;
   sourceOnlyFallbackRequestHash?: string;
+  /** Normalized private-tool redaction options; absent when the rung is off. */
+  privateToolRedactionFallback?: ToolArgRedactionOptions;
   /** Normalized tool-prose hoist options; absent when the rung is off. */
   toolProseFallback?: ToolProseHoistOptions;
 }
@@ -4211,6 +4217,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
+  /** Normalized `compressionPrivateToolRedactionFallback`, or undefined when off/invalid. */
+  private privateToolRedactionOptions(): ToolArgRedactionOptions | undefined {
+    const raw = this.config.compressionPrivateToolRedactionFallback;
+    if (!raw || !Array.isArray(raw.fromTools) || !Array.isArray(raw.fields)) return undefined;
+    const fromTools = [...new Set(raw.fromTools.filter((value) => typeof value === 'string' && value.length > 0))].sort();
+    const fields = [...new Set(raw.fields.filter((value) => typeof value === 'string' && value.length > 0))].sort();
+    return fromTools.length > 0 && fields.length > 0 ? { fields, fromTools } : undefined;
+  }
+
+  /**
+   * Provider-facing request with configured private tool arguments emptied, or
+   * undefined when the rung is off/nothing qualifies. Raw Chronicle is untouched.
+   */
+  private privateToolRedactedRequest(
+    request: NormalizedRequest,
+  ): { request: NormalizedRequest; redacted: number; characters: number } | undefined {
+    const options = this.privateToolRedactionOptions();
+    if (!options) return undefined;
+    const { messages, redacted, characters } = redactToolArguments(request.messages, options);
+    return redacted > 0
+      ? { request: { ...request, messages: messages as NormalizedRequest['messages'] }, redacted, characters }
+      : undefined;
+  }
+
   /** Normalized `compressionToolProseFallback`, or undefined when off/invalid. */
   private toolProseHoistOptions(): ToolProseHoistOptions | undefined {
     const raw = this.config.compressionToolProseFallback;
@@ -4261,6 +4291,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const fallbackLimit = this.normalizedCompressionFallbackLimit();
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
+    const privateToolRedactionFallback = this.privateToolRedactionOptions();
     const toolProseFallback = this.toolProseHoistOptions();
     const normalizedConfig: CompressionRefusalNormalizedConfig = {
       accountingVersion: COMPRESSION_BUDGET_ACCOUNTING_VERSION,
@@ -4273,8 +4304,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(sourceOnlyFallbackRequestHash !== undefined
         ? { sourceOnlyFallbackRequestHash }
         : {}),
-      // Conditionally spread: with the rung off the record, its key and its
-      // family stay byte-identical to what they were before the rung existed.
+      // Conditionally spread: with a rung off the record, its key and family
+      // stay byte-identical to what they were before that rung existed.
+      ...(privateToolRedactionFallback ? { privateToolRedactionFallback } : {}),
       ...(toolProseFallback ? { toolProseFallback } : {}),
     };
     const familyKey = sha256Json({
@@ -7131,11 +7163,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         quarantineRecord.normalizedConfig.sourceOnlyFallbackEnabled &&
       active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
         quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash &&
-      // Same rule for the tool-prose rung: enabling or re-pointing it is a
-      // request-family change (no options and some options differ). The
-      // options are compared as canonicalJson gives them, since a record read
-      // back from the store has their keys in another order than
-      // toolProseHoistOptions builds them in.
+      // Same rule for privacy/hoist rungs: enabling or re-pointing either is a
+      // request-family change. canonicalJson keeps stored and live option
+      // objects equal even when Chronicle returns their keys in another order.
+      canonicalJson(active.record.normalizedConfig?.privateToolRedactionFallback ?? null) ===
+        canonicalJson(quarantineRecord.normalizedConfig.privateToolRedactionFallback ?? null) &&
       canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
         canonicalJson(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
     );
@@ -7508,14 +7540,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         let fallbackResponse: NormalizedResponse | undefined;
 
-        // One bounded attempt of a tool-prose-hoisted request. Same receipts
-        // as the source-only final rung; provider errors never escalate. It
+        // One bounded transformed-request attempt. Used by the private-argument
+        // redaction and tool-prose hoist rungs; provider errors never escalate. It
         // is admitted as a recall variant is, against the request it rewrites
         // (`base`), which the provider has just counted and whose answer was a
         // refusal or came back incomplete (compressionAdmission): a rejection
         // is recorded as a variant's is, and nothing is sent.
-        const runToolProseRung = async (
-          hoistedRequest: NormalizedRequest,
+        const runTransformedRung = async (
+          transformedRequest: NormalizedRequest,
           base: { request: NormalizedRequest; providerInputTokens: number | undefined },
           curveLabel: string,
           recallIds: string[],
@@ -7523,12 +7555,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           coverageHash: string,
         ): Promise<void> => {
           // Hashed as prepared; runAttempt logs what was replaced as it sends it.
-          hoistedRequest = this.prepareCompressionAhead(hoistedRequest);
-          const requestHash = sha256Json(hoistedRequest);
+          transformedRequest = this.prepareCompressionAhead(transformedRequest);
+          const requestHash = sha256Json(transformedRequest);
           const admission = this.compressionAdmission(
             base.request,
-            hoistedRequest,
-            this.compressionRequestInputBoundTokens(hoistedRequest),
+            transformedRequest,
+            this.compressionRequestInputBoundTokens(transformedRequest),
             base.providerInputTokens,
           );
           if (admission.disposition === 'admission_rejected') {
@@ -7538,8 +7570,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               recallLevels,
               leafCoverageHash: coverageHash,
               requestHash,
-              messageCount: hoistedRequest.messages.length,
-              estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
+              messageCount: transformedRequest.messages.length,
+              estimatedTokens: this.estimateCompressionRequestTokens(transformedRequest),
               latencyMs: 0,
               persisted: false,
               outcome: 'admission_rejected',
@@ -7558,7 +7590,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return;
           }
           try {
-            const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
+            const rungResponse = await runAttempt(transformedRequest, curveLabel, recallIds, recallLevels, coverageHash);
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(rungResponse);
             if (assessment.outcome === 'valid') {
@@ -7588,6 +7620,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         };
 
+        // ---- private tool-argument redaction rung ----
+        // FIRST after a reasoning_extraction refusal: these fields are declared
+        // private by the host tool contract, so the summarizer receives the call
+        // and order but not its rationale. Raw Chronicle source is unchanged.
+        if (
+          canonicalOutcome === 'refusal' &&
+          attemptTraces[0]?.refusalCategory === 'reasoning_extraction'
+        ) {
+          const redactedCanonical = this.privateToolRedactedRequest(request);
+          if (redactedCanonical) {
+            logCompressionCall({
+              event: 'compression:private-tool-redaction-retry',
+              operation: 'compress_l1',
+              metadata: {
+                curveLabel: 'private-tool-args-redacted',
+                redacted: redactedCanonical.redacted,
+                characters: redactedCanonical.characters,
+              },
+            });
+            await runTransformedRung(
+              redactedCanonical.request,
+              { request, providerInputTokens: canonicalProviderInputTokens },
+              'private-tool-args-redacted',
+              keptSummaries.map((summary) => summary.id),
+              keptSummaries.map((summary) => summary.level),
+              canonicalCoverageHash,
+            );
+          }
+        }
+
         // ---- tool-prose hoist rung (compressionToolProseFallback) ----
         // FIRST after a canonical refusal, ahead of the recall variants: the
         // variants vary the recall frontier and cannot dodge a carrier that
@@ -7596,10 +7658,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // 22/22 passed with only this rewrite). Keeps the full canonical
         // context, so a win here costs no voice. Refusal-gated: a truncated or
         // tool_use canonical is not this rung's problem.
-        if (canonicalOutcome === 'refusal') {
+        if (!fallbackResponse && canonicalOutcome === 'refusal') {
           const hoistedCanonical = this.toolProseHoistedRequest(request);
           if (hoistedCanonical) {
-            await runToolProseRung(
+            await runTransformedRung(
               hoistedCanonical,
               { request, providerInputTokens: canonicalProviderInputTokens },
               'tool-prose-hoist',
@@ -7763,7 +7825,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // (Sol, #106 review: a thrown server_error on source-only-final still
         // bought a fourth call).
         let sourceOnlyOutcome: CompressionAttemptOutcome | 'incomplete' | undefined;
-        // Its count, the base its hoist is admitted against.
+        let sourceOnlyTrace: CompressionAttemptTrace | undefined;
+        // Its count, the base its transformed retries are admitted against.
         let sourceOnlyProviderInputTokens: number | undefined;
         if (!fallbackResponse && sourceOnlyFallbackRequest) {
           const curveLabel = 'source-only-final';
@@ -7774,6 +7837,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sha256Json(chunk.messages.map((message) => message.id)),
             );
             const trace = attemptTraces[attemptTraces.length - 1]!;
+            sourceOnlyTrace = trace;
             const assessment = this.assessFallbackCompressionResponse(sourceOnlyResponse);
             sourceOnlyProviderInputTokens = baseInputTokens(sourceOnlyResponse);
             if (assessment.outcome === 'valid') {
@@ -7805,6 +7869,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         }
 
+        // Source-only final refused for the same reasoning-extraction category:
+        // apply the privacy-preserving omission before considering the richer
+        // journal hoist. Raw source remains byte-exact in Chronicle.
+        if (
+          !fallbackResponse &&
+          sourceOnlyFallbackRequest &&
+          sourceOnlyOutcome === 'refusal' &&
+          sourceOnlyTrace?.refusalCategory === 'reasoning_extraction'
+        ) {
+          const redactedSourceOnly = this.privateToolRedactedRequest(sourceOnlyFallbackRequest);
+          if (redactedSourceOnly) {
+            logCompressionCall({
+              event: 'compression:private-tool-redaction-retry',
+              operation: 'compress_l1',
+              metadata: {
+                curveLabel: 'source-only-private-tool-args-redacted',
+                redacted: redactedSourceOnly.redacted,
+                characters: redactedSourceOnly.characters,
+              },
+            });
+            await runTransformedRung(
+              redactedSourceOnly.request,
+              { request: sourceOnlyFallbackRequest, providerInputTokens: sourceOnlyProviderInputTokens },
+              'source-only-private-tool-args-redacted',
+              [], [],
+              sha256Json(chunk.messages.map((message) => message.id)),
+            );
+          }
+        }
+
         // Source-only final REFUSED too: the same carrier sits in the target
         // chunk itself, so give the source-only shape the same rewrite once.
         // Refusal-gated like the canonical hoist: any other way that attempt
@@ -7812,7 +7906,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!fallbackResponse && sourceOnlyFallbackRequest && sourceOnlyOutcome === 'refusal') {
           const hoistedSourceOnly = this.toolProseHoistedRequest(sourceOnlyFallbackRequest);
           if (hoistedSourceOnly) {
-            await runToolProseRung(
+            await runTransformedRung(
               hoistedSourceOnly,
               { request: sourceOnlyFallbackRequest, providerInputTokens: sourceOnlyProviderInputTokens },
               'source-only-tool-prose-hoist',
